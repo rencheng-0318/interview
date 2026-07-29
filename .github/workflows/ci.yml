@@ -40,15 +40,6 @@ jobs:
         working-directory: services/api
         run: pip install -e ".[dev]"
 
-      - name: Create the test database and extension
-        run: |
-          PGPASSWORD=local_dev_only psql -h localhost -U clinical -d postgres \
-            -c 'CREATE DATABASE clinical_search_test OWNER clinical'
-          for db in clinical_search clinical_search_test; do
-            PGPASSWORD=local_dev_only psql -h localhost -U clinical -d "$db" \
-              -c 'CREATE EXTENSION IF NOT EXISTS vector'
-          done
-
       - name: Lint
         working-directory: services/api
         run: |
