@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+@theme {
+  --color-canvas: #f8fafc;
+  --color-surface: #ffffff;
+  --color-surface-raised: #f1f5f9;
+  --color-border: #e2e8f0;
+  --color-border-strong: #7c8ba1;
+
+  --color-content: #0f172a;
+  --color-content-secondary: #475569;
+  --color-content-muted: #5a6b82;
+
+  --color-primary: #1d4ed8;
+  --color-primary-hover: #1a45be;
+  --color-primary-contrast: #ffffff;
+  --color-ring: #1d4ed8;
+
+  --color-success: #15803c;
+  --color-success-surface: #f0fdf4;
+  --color-warning: #96690d;
+  --color-warning-surface: #fffbeb;
+  --color-danger: #b91c1c;
+  --color-danger-surface: #fef2f2;
+  --color-info: #1d4ed8;
+  --color-info-surface: #eff6ff;
+
+  --color-accent: #845c08;
+  --color-accent-surface: #fef3c7;
+  --color-evidence: #0f172a;
+  --color-evidence-surface: #fef08a;
+}
+
+@layer base {
+  :root {
+    color-scheme: light dark;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --color-canvas: #0b1220;
+      --color-surface: #131c2e;
+      --color-surface-raised: #1a2540;
+      --color-border: #1e2a3b;
+      --color-border-strong: #5c7091;
+
+      --color-content: #e2e8f0;
+      --color-content-secondary: #afbcce;
+      --color-content-muted: #93a2b8;
+
+      --color-primary: #60a5fa;
+      --color-primary-hover: #7fb3fb;
+      --color-primary-contrast: #06122b;
+      --color-ring: #7fb3fb;
+
+      --color-success: #6ee7a0;
+      --color-success-surface: #08221a;
+      --color-warning: #fbc65a;
+      --color-warning-surface: #241a05;
+      --color-danger: #fca5a5;
+      --color-danger-surface: #2a1113;
+      --color-info: #93c5fd;
+      --color-info-surface: #0e1b33;
+
+      --color-accent: #fbc65a;
+      --color-accent-surface: #241a05;
+      --color-evidence: #fde68a;
+      --color-evidence-surface: #3a2e07;
+    }
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-content);
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+      sans-serif;
+    line-height: 1.55;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ring);
+    outline-offset: 2px;
+  }
+
+  mark {
+    background-color: var(--color-evidence-surface);
+    color: var(--color-evidence);
+    padding: 0 0.125rem;
+    border-radius: 0.125rem;
+  }
+}

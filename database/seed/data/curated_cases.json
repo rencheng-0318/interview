@@ -1,0 +1,101 @@
+{
+  "seed": 20260728,
+  "anchorDate": "2026-07-01",
+  "primaryPracticeId": "practice-northside",
+  "practiceCount": 3,
+  "patientCount": 715,
+  "documentCount": 2400,
+  "pathologicalDocumentCount": 6,
+  "cases": [
+    {
+      "id": "case-migraine-aura",
+      "query": "recurring headaches preceded by flashing lights, nausea, and sensitivity to light",
+      "conditionKey": "migraine_with_aura",
+      "expectedPatientId": "patient-0001",
+      "expectedDocumentId": "document-000001",
+      "expectedMatchingDocumentCount": 2,
+      "crossPracticeDecoyPatientId": "patient-0002",
+      "crossPracticeDecoyPracticeId": "practice-lakeshore",
+      "crossPracticeDecoyDocumentId": "document-000004",
+      "inPracticeDistractorPatientIds": [
+        "patient-0003",
+        "patient-0004"
+      ]
+    },
+    {
+      "id": "case-osmotic-symptoms",
+      "query": "persistent thirst, frequent urination, and elevated glucose",
+      "conditionKey": "type2_diabetes",
+      "expectedPatientId": "patient-0005",
+      "expectedDocumentId": "document-000010",
+      "expectedMatchingDocumentCount": 2,
+      "crossPracticeDecoyPatientId": "patient-0006",
+      "crossPracticeDecoyPracticeId": "practice-summit",
+      "crossPracticeDecoyDocumentId": "document-000013",
+      "inPracticeDistractorPatientIds": [
+        "patient-0007",
+        "patient-0008"
+      ]
+    },
+    {
+      "id": "case-congestive-dyspnoea",
+      "query": "shortness of breath with bilateral leg swelling",
+      "conditionKey": "heart_failure",
+      "expectedPatientId": "patient-0009",
+      "expectedDocumentId": "document-000019",
+      "expectedMatchingDocumentCount": 2,
+      "crossPracticeDecoyPatientId": "patient-0010",
+      "crossPracticeDecoyPracticeId": "practice-lakeshore",
+      "crossPracticeDecoyDocumentId": "document-000022",
+      "inPracticeDistractorPatientIds": [
+        "patient-0011",
+        "patient-0012"
+      ]
+    },
+    {
+      "id": "case-exertional-wheeze",
+      "query": "exercise-related chest tightness and wheezing",
+      "conditionKey": "exercise_induced_asthma",
+      "expectedPatientId": "patient-0013",
+      "expectedDocumentId": "document-000028",
+      "expectedMatchingDocumentCount": 2,
+      "crossPracticeDecoyPatientId": "patient-0014",
+      "crossPracticeDecoyPracticeId": "practice-summit",
+      "crossPracticeDecoyDocumentId": "document-000031",
+      "inPracticeDistractorPatientIds": [
+        "patient-0015",
+        "patient-0016"
+      ]
+    },
+    {
+      "id": "case-nocturnal-foot-pain",
+      "query": "burning pain in the feet at night with numbness",
+      "conditionKey": "diabetic_peripheral_neuropathy",
+      "expectedPatientId": "patient-0017",
+      "expectedDocumentId": "document-000037",
+      "expectedMatchingDocumentCount": 2,
+      "crossPracticeDecoyPatientId": "patient-0018",
+      "crossPracticeDecoyPracticeId": "practice-lakeshore",
+      "crossPracticeDecoyDocumentId": "document-000040",
+      "inPracticeDistractorPatientIds": [
+        "patient-0019",
+        "patient-0020"
+      ]
+    },
+    {
+      "id": "case-biliary-jaundice",
+      "query": "yellowing of the eyes with pain in the upper right abdomen",
+      "conditionKey": "cholelithiasis",
+      "expectedPatientId": "patient-0021",
+      "expectedDocumentId": "document-000046",
+      "expectedMatchingDocumentCount": 2,
+      "crossPracticeDecoyPatientId": "patient-0022",
+      "crossPracticeDecoyPracticeId": "practice-summit",
+      "crossPracticeDecoyDocumentId": "document-000049",
+      "inPracticeDistractorPatientIds": [
+        "patient-0023",
+        "patient-0024"
+      ]
+    }
+  ]
+}

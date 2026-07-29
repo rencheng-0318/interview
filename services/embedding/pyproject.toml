@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["app"]
+
+[project]
+name = "interview-embedding-service"
+version = "1.0.0"
+description = "Local embedding service for the clinical search exercise"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi==0.140.7",
+    "uvicorn[standard]==0.51.0",
+    "pydantic==2.13.4",
+    "pydantic-settings==2.14.2",
+    "onnxruntime==1.28.0",
+    "tokenizers==0.23.1",
+    "numpy==2.5.1",
+]
+
+[project.optional-dependencies]
+build = ["huggingface-hub==1.25.1"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

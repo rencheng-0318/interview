@@ -1,0 +1,95 @@
+name: clinical-search-take-home
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: database/Dockerfile
+    image: clinical-search-postgres:18-pgvector-0.8.5
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-clinical}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-clinical_search}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db_data:/var/lib/postgresql
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-clinical} -d ${POSTGRES_DB:-clinical_search}"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  embedding:
+    build:
+      context: ./services/embedding
+    environment:
+      EMBEDDING_MODEL_DIR: /opt/model
+      EMBEDDING_FAILURE_RATE: ${EMBEDDING_FAILURE_RATE:-0.0}
+      EMBEDDING_LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
+    ports:
+      - "${EMBEDDING_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 40s
+
+  api:
+    build:
+      context: ./services/api
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-clinical}:${POSTGRES_PASSWORD:-local_dev_only}@db:5432/${POSTGRES_DB:-clinical_search}
+      TEST_DATABASE_URL: postgresql://${POSTGRES_USER:-clinical}:${POSTGRES_PASSWORD:-local_dev_only}@db:5432/clinical_search_test
+      EMBEDDING_SERVICE_URL: ${EMBEDDING_SERVICE_URL:-http://embedding:8080}
+      EMBEDDING_MAX_BATCH_SIZE: ${EMBEDDING_MAX_BATCH_SIZE:-64}
+      EMBEDDING_REQUEST_TIMEOUT_SECONDS: ${EMBEDDING_REQUEST_TIMEOUT_SECONDS:-30}
+      API_LOG_LEVEL: ${API_LOG_LEVEL:-INFO}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-http://localhost:3000}
+      SEARCH_DEFAULT_LIMIT: ${SEARCH_DEFAULT_LIMIT:-10}
+      SEARCH_MAX_LIMIT: ${SEARCH_MAX_LIMIT:-25}
+      SEARCH_MAX_QUERY_LENGTH: ${SEARCH_MAX_QUERY_LENGTH:-500}
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./services/api/app:/srv/app:ro
+      - ./services/api/tests:/srv/tests:ro
+      - ./database:/srv/database:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  web:
+    build:
+      context: ./apps/web
+      target: dev
+    environment:
+      API_BASE_URL: ${API_BASE_URL:-http://api:8000}
+      NODE_ENV: development
+      WATCHPACK_POLLING: "true"
+    command: pnpm dev
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    volumes:
+      - ./apps/web:/srv
+      - web_node_modules:/srv/node_modules
+      - web_next_cache:/srv/.next
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  db_data:
+  web_node_modules:
+  web_next_cache:
