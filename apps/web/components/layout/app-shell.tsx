@@ -8,6 +8,7 @@ import { PracticeSwitcher } from "./practice-switcher";
 const NAV_LINKS = [
   { href: "/", label: "Overview" },
   { href: "/search", label: "Clinical search" },
+  { href: "/evaluation", label: "Search quality" },
 ];
 
 interface AppShellProps {

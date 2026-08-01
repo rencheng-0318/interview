@@ -8,6 +8,7 @@ from app.clients.embedding import EmbeddingClient
 from app.config import get_settings
 from app.db.pool import create_pool
 from app.errors import register_error_handlers
+from app.features.evaluation.router import router as evaluation_router
 from app.features.health.router import router as health_router
 from app.features.patients.router import router as patients_router
 from app.features.search.router import router as search_router
@@ -65,6 +66,7 @@ def create_app() -> FastAPI:
     app.include_router(session_router)
     app.include_router(patients_router)
     app.include_router(search_router)
+    app.include_router(evaluation_router)
     return app
 
 
