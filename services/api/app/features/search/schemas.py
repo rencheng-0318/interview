@@ -33,9 +33,15 @@ class SearchResult(CamelModel):
 class SearchMeta(CamelModel):
     result_count: int
     took_ms: int
+    degraded: bool = False
 
 
 class ClinicalSearchResponse(CamelModel):
     query: str
     results: list[SearchResult]
     meta: SearchMeta
+
+
+class SearchSuggestionsResponse(CamelModel):
+    suggestions: list[str]
+    query: str

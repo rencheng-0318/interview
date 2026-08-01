@@ -53,16 +53,23 @@ function ReportView({ report }: { report: EvaluationReport }) {
           hint={`${summary.hitCount}/${summary.totalCases} cases found`}
         />
         <MetricCard label="MRR" value={summary.mrr.toFixed(3)} hint="Mean reciprocal rank" />
-        <MetricCard
-          label="Avg latency"
-          value={`${summary.avgLatencyMs.toFixed(0)} ms`}
-          hint="Per query"
-        />
+        <MetricCard label="NDCG" value={summary.ndcg.toFixed(3)} hint="Ranking quality" />
         <MetricCard
           label="Decoy leaks"
           value={String(summary.decoyLeakCount)}
           hint="Cross-practice isolation"
         />
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+        <MetricCard
+          label="Avg latency"
+          value={`${summary.avgLatencyMs.toFixed(0)} ms`}
+          hint="Per query"
+        />
+        <MetricCard label="P50 latency" value={`${summary.p50LatencyMs} ms`} hint="50th percentile" />
+        <MetricCard label="P95 latency" value={`${summary.p95LatencyMs} ms`} hint="95th percentile" />
+        <MetricCard label="P99 latency" value={`${summary.p99LatencyMs} ms`} hint="99th percentile" />
       </div>
 
       <Card>

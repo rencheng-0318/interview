@@ -203,12 +203,15 @@ async def test_invalid_requests_are_rejected_without_embedding(
 # ---------------------------------------------------------------------------
 
 
-async def test_search_reports_service_unavailable_when_embedding_is_down(
+async def test_search_degrades_to_bm25_when_embedding_is_down(
     connection: asyncpg.Connection,
 ) -> None:
-    from app.main import create_app
+    """When embedding service is unavailable, search degrades to BM25-only."""
+    from httpx import ASGITransport
+    from httpx import AsyncClient as HttpxClient
+
     from app.config import get_settings
-    from httpx import ASGITransport, AsyncClient as HttpxClient
+    from app.main import create_app
 
     settings = get_settings()
     app = create_app()
@@ -224,9 +227,10 @@ async def test_search_reports_service_unavailable_when_embedding_is_down(
             headers={"Authorization": "Bearer demo_user-northside-01"},
         )
 
-    assert response.status_code == 503
+    # Search still returns 200 but with degraded=True
+    assert response.status_code == 200
     body = response.json()
-    assert body["error"]["code"] == "embedding_service_unavailable"
+    assert body["meta"]["degraded"] is True
     # No stack trace in response
     assert "Traceback" not in response.text
     assert "asyncpg" not in response.text

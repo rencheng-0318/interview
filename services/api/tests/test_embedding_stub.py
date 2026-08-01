@@ -37,3 +37,45 @@ async def test_stub_rejects_blank_text_like_the_real_service() -> None:
 
     with pytest.raises(EmbeddingInputRejected):
         await client.embed(["valid text", "   "])
+
+
+async def test_retry_succeeds_after_transient_failures() -> None:
+    """Test that EmbeddingClient retries on transient failures."""
+    from unittest.mock import MagicMock, patch
+
+    from app.clients.embedding import EmbeddingClient
+
+    client = EmbeddingClient(
+        base_url="http://test:8080",
+        timeout_seconds=1.0,
+        max_batch_size=64,
+        retry_max_attempts=3,
+        retry_base_delay=0.01,  # fast for testing
+    )
+
+    call_count = 0
+
+    async def mock_post(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            # Simulate transient failure
+            import httpx
+            raise httpx.ConnectError("connection refused")
+        # Success on 3rd attempt - return a regular MagicMock (not async)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "model": "test-model",
+            "dimensions": 384,
+            "embeddings": [[0.1] * 384],
+        }
+        mock_response.raise_for_status = lambda: None
+        return mock_response
+
+    with patch.object(client._client, "post", side_effect=mock_post):
+        result = await client.embed(["test text"])
+
+    assert call_count == 3
+    assert len(result.vectors) == 1
+    await client.aclose()

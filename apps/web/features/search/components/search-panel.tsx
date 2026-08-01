@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useCallback, useState } from "react";
 import { useActionState } from "react";
 import { useFormStatus } from "react-dom";
 
@@ -9,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody } from "@/components/ui/card";
 import { EmptyState } from "@/components/ui/empty-state";
-import { SelectField, TextField } from "@/components/ui/input";
+import { SelectField } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import {
   DOCUMENT_TYPES,
@@ -18,6 +19,7 @@ import {
 
 import { searchAction } from "../actions";
 import { INITIAL_STATE, type SearchState } from "../types";
+import { SearchSuggestions } from "./search-suggestions";
 
 function SubmitButton() {
   const { pending } = useFormStatus();
@@ -107,20 +109,27 @@ function SearchResults({ state }: { state: SearchState }) {
 
 export function SearchPanel() {
   const [state, formAction] = useActionState(searchAction, INITIAL_STATE);
+  const [query, setQuery] = useState(state.query ?? "");
+
+  const handleSelectSuggestion = useCallback((value: string) => {
+    setQuery(value);
+  }, []);
 
   return (
     <div className="space-y-6">
       <form action={formAction} className="space-y-4">
-        <TextField
-          label="Clinical query"
-          name="query"
-          placeholder="e.g. recurring headaches with nausea and light sensitivity"
-          hint="Describe a presentation in plain language (max 500 characters)."
-          defaultValue={state.query ?? ""}
-          required
-          minLength={1}
-          maxLength={500}
-        />
+        <div className="w-full">
+          <label htmlFor="query" className="mb-1.5 block text-sm font-medium text-content">
+            Clinical query
+          </label>
+          <SearchSuggestions
+            query={query}
+            onQueryChange={setQuery}
+            onSelect={handleSelectSuggestion}
+            inputId="query"
+          />
+          <input type="hidden" name="query" value={query} />
+        </div>
 
         <div className="flex items-end gap-3">
           <div className="w-56">

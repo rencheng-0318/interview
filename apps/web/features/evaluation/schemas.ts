@@ -18,7 +18,11 @@ export const EvaluationSummarySchema = z.object({
   hitCount: z.number().int().nonnegative(),
   hitRate: z.number(),
   mrr: z.number(),
+  ndcg: z.number(),
   avgLatencyMs: z.number(),
+  p50LatencyMs: z.number().int().nonnegative(),
+  p95LatencyMs: z.number().int().nonnegative(),
+  p99LatencyMs: z.number().int().nonnegative(),
   decoyLeakCount: z.number().int().nonnegative(),
 });
 

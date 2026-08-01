@@ -1,7 +1,7 @@
 """Indexing workflow: chunk clinical documents and store embeddings."""
 
+import contextlib
 import logging
-import re
 from dataclasses import dataclass, field
 
 import asyncpg
@@ -27,56 +27,24 @@ class IndexSummary:
 
 
 # ---------------------------------------------------------------------------
-# Chunking
+# Chunking: Recursive Character Splitting
 # ---------------------------------------------------------------------------
 
-_SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+# Separator hierarchy: paragraph -> sentence -> word -> character
+SEPARATORS = ["\n\n", ". ", " ", ""]
 
 
 def chunk_text(
     text: str, max_chars: int = MAX_CHUNK_CHARS, overlap: int = OVERLAP_CHARS
 ) -> list[str]:
-    """Split text into overlapping chunks at sentence/paragraph boundaries."""
+    """Split text using recursive character splitting at semantic boundaries."""
     text = text.strip()
     if not text:
         return []
     if len(text) <= max_chars:
         return [text]
 
-    paragraphs = text.split("\n\n")
-    chunks: list[str] = []
-    current = ""
-
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-
-        if len(current) + len(paragraph) + 2 <= max_chars:
-            current = f"{current}\n\n{paragraph}" if current else paragraph
-        else:
-            if current:
-                chunks.append(current)
-            if len(paragraph) <= max_chars:
-                current = paragraph
-            else:
-                sentences = _SENTENCE_BOUNDARY.split(paragraph)
-                current = ""
-                for sentence in sentences:
-                    if len(current) + len(sentence) + 1 <= max_chars:
-                        current = f"{current} {sentence}" if current else sentence
-                    else:
-                        if current:
-                            chunks.append(current)
-                        if len(sentence) > max_chars:
-                            for i in range(0, len(sentence), max_chars - overlap):
-                                chunks.append(sentence[i : i + max_chars])
-                            current = ""
-                        else:
-                            current = sentence
-
-    if current:
-        chunks.append(current)
+    chunks = _recursive_split(text, max_chars, SEPARATORS)
 
     # Apply overlap between consecutive chunks
     if overlap > 0 and len(chunks) > 1:
@@ -87,6 +55,49 @@ def chunk_text(
         chunks = overlapped
 
     return [c.strip() for c in chunks if c.strip()]
+
+
+def _recursive_split(
+    text: str, max_chars: int, separators: list[str]
+) -> list[str]:
+    """Recursively split text using separator hierarchy."""
+    if len(text) <= max_chars:
+        return [text]
+
+    for i, sep in enumerate(separators):
+        if not sep:
+            # Last resort: hard split with overlap
+            step = max_chars - OVERLAP_CHARS
+            return [text[j : j + max_chars] for j in range(0, len(text), step)]
+
+        parts = text.split(sep)
+        chunks: list[str] = []
+        current = ""
+
+        for part in parts:
+            if not part:
+                continue
+            candidate = f"{current}{sep}{part}" if current else part
+            if len(candidate) <= max_chars:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                if len(part) > max_chars:
+                    # Recursively handle oversized parts
+                    sub_chunks = _recursive_split(part, max_chars, separators[i + 1 :])
+                    chunks.extend(sub_chunks)
+                    current = ""
+                else:
+                    current = part
+
+        if current:
+            chunks.append(current)
+
+        if chunks:
+            return chunks
+
+    return [text]
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +128,14 @@ DELETE_CHUNKS_SQL = "DELETE FROM document_chunks WHERE document_id = $1"
 INSERT_CHUNK_SQL = """
 INSERT INTO document_chunks
     (document_id, practice_id, patient_id, document_type,
-     chunk_index, content, embedding, source_updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     chunk_index, content, embedding, source_updated_at, content_tsv)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, to_tsvector('english', $6))
 ON CONFLICT (document_id, chunk_index)
 DO UPDATE SET
     content = EXCLUDED.content,
     embedding = EXCLUDED.embedding,
-    source_updated_at = EXCLUDED.source_updated_at
+    source_updated_at = EXCLUDED.source_updated_at,
+    content_tsv = to_tsvector('english', EXCLUDED.content)
 """
 
 
@@ -202,27 +214,44 @@ async def run_indexing(pool: asyncpg.Pool, embedding_client: SupportsEmbedding) 
         logger.info("no embeddable content found")
         return summary
 
-    # Phase 2: embed all chunks
+    # Phase 2: embed per-document (failure isolation: one doc failure doesn't block others)
     logger.info("embedding chunks=%d documents=%d", len(all_texts), len(doc_chunks_list))
-    try:
-        batch_result = await embedding_client.embed(all_texts)
-    except Exception as exc:
-        logger.error("embedding failure: %s", type(exc).__name__)
-        summary.failed = len(doc_chunks_list)
-        summary.errors.append(f"embedding: {type(exc).__name__}")
-        return summary
 
-    vectors = batch_result.vectors
+    # Build text slices per document
+    doc_text_ranges: dict[int, list[int]] = {}
+    for text_idx, doc_idx in enumerate(text_to_doc):
+        doc_text_ranges.setdefault(doc_idx, []).append(text_idx)
+
+    # Embed each document's chunks independently
+    doc_vectors: dict[int, list[list[float]]] = {}
+    for doc_idx, dc in enumerate(doc_chunks_list):
+        text_indices = doc_text_ranges[doc_idx]
+        doc_chunks_text = [all_texts[i] for i in text_indices]
+        try:
+            batch_result = await embedding_client.embed(doc_chunks_text)
+            doc_vectors[doc_idx] = batch_result.vectors
+        except Exception as exc:
+            summary.failed += 1
+            summary.errors.append(f"{dc.doc_id}: embed {type(exc).__name__}")
+            logger.warning("embedding failed document_id=%s error=%s", dc.doc_id, exc)
 
     # Phase 3: persist per document (transaction per doc for fault isolation)
-    # Build vector slices per document
-    doc_vector_ranges: dict[int, list[int]] = {}
-    for text_idx, doc_idx in enumerate(text_to_doc):
-        doc_vector_ranges.setdefault(doc_idx, []).append(text_idx)
-
     async with pool.acquire() as conn:
         for doc_idx, dc in enumerate(doc_chunks_list):
-            text_indices = doc_vector_ranges[doc_idx]
+            if doc_idx not in doc_vectors:
+                # Embedding failed for this doc; clean up any partial chunks
+                try:
+                    await conn.execute(DELETE_CHUNKS_SQL, dc.doc_id)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "cleanup failed document_id=%s error=%s",
+                        dc.doc_id,
+                        cleanup_exc,
+                    )
+                continue
+
+            vectors = doc_vectors[doc_idx]
+            text_indices = doc_text_ranges[doc_idx]
             try:
                 async with conn.transaction():
                     await conn.execute(DELETE_CHUNKS_SQL, dc.doc_id)
@@ -235,15 +264,18 @@ async def run_indexing(pool: asyncpg.Pool, embedding_client: SupportsEmbedding) 
                             dc.document_type,
                             chunk_pos,
                             all_texts[text_idx],
-                            vectors[text_idx],
+                            vectors[chunk_pos],
                             dc.source_updated_at,
                         )
                 summary.indexed += 1
                 summary.chunks_created += len(text_indices)
             except Exception as exc:
+                # Write failed; clean up partial data so next run can retry
+                with contextlib.suppress(Exception):
+                    await conn.execute(DELETE_CHUNKS_SQL, dc.doc_id)
                 summary.failed += 1
-                summary.errors.append(f"{dc.doc_id}: {type(exc).__name__}")
-                logger.warning("failed document_id=%s error=%s", dc.doc_id, exc)
+                summary.errors.append(f"{dc.doc_id}: write {type(exc).__name__}")
+                logger.warning("write failed document_id=%s error=%s", dc.doc_id, exc)
 
     logger.info(
         "indexing complete total=%d indexed=%d skipped=%d failed=%d chunks=%d",
