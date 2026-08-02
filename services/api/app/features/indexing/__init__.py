@@ -106,7 +106,24 @@ def _recursive_split(
 
 TOTAL_COUNT_SQL = "SELECT count(*) FROM clinical_documents"
 
-PENDING_DOCUMENTS_SQL = """
+PENDING_DOCUMENTS_SQL_NO_LIMIT = """
+SELECT
+    cd.id,
+    cd.practice_id,
+    cd.patient_id,
+    cd.document_type,
+    cd.body,
+    cd.source_updated_at
+FROM clinical_documents cd
+WHERE NOT EXISTS (
+    SELECT 1 FROM document_chunks dc
+    WHERE dc.document_id = cd.id
+      AND dc.source_updated_at = cd.source_updated_at
+)
+ORDER BY cd.id
+"""
+
+PENDING_DOCUMENTS_SQL_WITH_LIMIT = """
 SELECT
     cd.id,
     cd.practice_id,
@@ -172,9 +189,9 @@ async def run_indexing(
     async with pool.acquire() as conn:
         total_in_db = await conn.fetchval(TOTAL_COUNT_SQL)
         if max_documents is not None:
-            rows = await conn.fetch(PENDING_DOCUMENTS_SQL, max_documents)
+            rows = await conn.fetch(PENDING_DOCUMENTS_SQL_WITH_LIMIT, max_documents)
         else:
-            rows = await conn.fetch(PENDING_DOCUMENTS_SQL)
+            rows = await conn.fetch(PENDING_DOCUMENTS_SQL_NO_LIMIT)
 
     summary.total_documents = total_in_db
     summary.already_indexed = total_in_db - len(rows)
