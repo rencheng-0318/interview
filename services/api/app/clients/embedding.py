@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import random
 from dataclasses import dataclass
@@ -50,10 +51,6 @@ class EmbeddingClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    @property
-    def is_circuit_open(self) -> bool:
-        return self._circuit_breaker is not None and self._circuit_breaker.is_open
-
     async def is_healthy(self) -> bool:
         try:
             response = await self._client.get(HEALTH_PATH)
@@ -101,8 +98,6 @@ class EmbeddingClient:
                         wait,
                         type(exc).__name__,
                     )
-                    import asyncio
-
                     await asyncio.sleep(wait)
         raise last_exc  # type: ignore[misc]
 

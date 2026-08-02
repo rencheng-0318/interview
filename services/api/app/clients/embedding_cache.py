@@ -48,24 +48,6 @@ class EmbeddingCache:
                 logger.debug("embedding_cache evicted key=%s", evicted_key[:50])
             self._cache[text] = vector
 
-    def get_or_compute_sync(self, text: str, compute_fn) -> list[float]:
-        """Get from cache or compute synchronously."""
-        cached = self.get(text)
-        if cached is not None:
-            return cached
-        vector = compute_fn(text)
-        self.put(text, vector)
-        return vector
-
-    async def get_or_compute(self, text: str, compute_fn) -> list[float]:
-        """Get from cache or compute asynchronously."""
-        cached = self.get(text)
-        if cached is not None:
-            return cached
-        vector = await compute_fn(text)
-        self.put(text, vector)
-        return vector
-
     @property
     def size(self) -> int:
         return len(self._cache)

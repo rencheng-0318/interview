@@ -97,25 +97,18 @@ def test_cache_clear(cache: EmbeddingCache):
     assert cache.get("a") is None
 
 
-async def test_cache_get_or_compute(cache: EmbeddingCache):
-    call_count = 0
+def test_cache_get_put_workflow(cache: EmbeddingCache):
+    """Verify the get/put pattern used by the search service."""
+    # Simulate: check cache -> miss -> compute -> store
+    assert cache.get("hello") is None
+    cache.put("hello", [5.0])
 
-    async def compute(text: str) -> list[float]:
-        nonlocal call_count
-        call_count += 1
-        return [float(len(text))]
+    # Second lookup hits cache
+    assert cache.get("hello") == [5.0]
+    assert cache._hits == 1
+    assert cache._misses == 1
 
-    # First call should compute
-    result1 = await cache.get_or_compute("hello", compute)
-    assert result1 == [5.0]
-    assert call_count == 1
-
-    # Second call should hit cache
-    result2 = await cache.get_or_compute("hello", compute)
-    assert result2 == [5.0]
-    assert call_count == 1  # compute not called again
-
-    # Different text should compute
-    result3 = await cache.get_or_compute("world!", compute)
-    assert result3 == [6.0]
-    assert call_count == 2
+    # Different text is a miss
+    assert cache.get("world!") is None
+    cache.put("world!", [6.0])
+    assert cache.get("world!") == [6.0]

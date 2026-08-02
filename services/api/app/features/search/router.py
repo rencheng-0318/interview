@@ -18,7 +18,7 @@ from app.features.search.schemas import (
     SearchResult,
     SearchSuggestionsResponse,
 )
-from app.features.search.service import search_patients
+from app.features.search.service import VECTOR_SEARCH_SQL, BM25_SEARCH_SQL, _aggregate_patients, DEFAULT_CANDIDATE_MULTIPLIER, MAX_CANDIDATE_LIMIT
 
 logger = logging.getLogger("api.search")
 
@@ -65,21 +65,62 @@ async def clinical_search(
         )
 
     limit = payload.limit if payload.limit is not None else settings.search_default_limit
+    if limit < 1:
+        raise ValidationError("limit must be at least 1.")
     if limit > settings.search_max_limit:
         raise ValidationError(f"limit must be at most {settings.search_max_limit}.")
 
+    # --- Get or create embedding (with caching) ---
+    query_vector = None
+    degraded = False
+    try:
+        cached_vector = None
+        if embedding_cache is not None:
+            cached_vector = embedding_cache.get(query)
+
+        if cached_vector is not None:
+            # Cache hit - use cached vector directly
+            query_vector = cached_vector
+        else:
+            # Cache miss - call embedding service
+            batch = await embedding_client.embed([query])
+            query_vector = batch.vectors[0]
+            if embedding_cache is not None:
+                embedding_cache.put(query, query_vector)
+    except Exception as exc:
+        logger.warning(
+            "embedding unavailable, BM25-only fallback: %s",
+            type(exc).__name__,
+        )
+        degraded = True
+
     # --- Vector retrieval + patient aggregation ---
     doc_types = payload.document_types if payload.document_types else None
+    
+    # Dynamic candidate limit based on dataset statistics (avg 3.36 docs/patient)
+    candidate_limit = min(limit * DEFAULT_CANDIDATE_MULTIPLIER, MAX_CANDIDATE_LIMIT)
+    
     async with pool.acquire() as conn:
-        patient_results, degraded = await search_patients(
-            conn,
-            embedding_client,
-            query,
-            context.practice_id,
-            doc_types,
-            limit,
-            embedding_cache=embedding_cache,
-        )
+        if query_vector is not None:
+            rows_raw = await conn.fetch(
+                VECTOR_SEARCH_SQL,
+                query_vector,
+                context.practice_id,
+                doc_types,
+                candidate_limit,
+            )
+        else:
+            # BM25-only fallback when embedding service is unavailable
+            rows_raw = await conn.fetch(
+                BM25_SEARCH_SQL,
+                query,
+                context.practice_id,
+                doc_types,
+                candidate_limit,
+            )
+        
+        patient_results = _aggregate_patients([dict(r) for r in rows_raw])
+        patient_results = patient_results[:limit]
 
     results = [
         SearchResult(
@@ -106,35 +147,64 @@ async def clinical_search(
     )
 
 
-# SQL to extract common phrases from document chunks for suggestions
-# Returns terms that start with or contain the query prefix
+# Extract natural 2-3 word phrases (bigrams/trigrams) from document chunks.
+# Optimized with WHERE clause to filter relevant content early.
 SUGGESTIONS_SQL = """
-WITH terms AS (
-    SELECT DISTINCT unnest(string_to_array(
+WITH base AS (
+    SELECT
         regexp_replace(
-            regexp_replace(LOWER(LEFT(content, 500)),
-            '[^a-z0-9\\s]', ' ', 'g'),
-        '\\s+', ' ', 'g')
-    , ' ')) AS term
+            regexp_replace(LOWER(LEFT(content, 600)), '[^a-z0-9\\s]', ' ', 'g'),
+            '\\s+', ' ', 'g'
+        ) AS text
     FROM document_chunks
     WHERE practice_id = $1
-      AND ($2::text IS NULL OR content ILIKE '%' || $2 || '%')
+      AND LENGTH(content) > 10  -- Quick filter: skip very short content
+),
+words AS (
+    SELECT
+        trim(unnest(string_to_array(text, ' '))) AS word,
+        generate_subscripts(string_to_array(text, ' '), 1) AS pos
+    FROM base
+    WHERE POSITION(' ' IN text) > 0  -- Only process text with spaces
+),
+bigrams AS (
+    SELECT w1.word || ' ' || w2.word AS phrase
+    FROM words w1
+    JOIN words w2 ON w2.pos = w1.pos + 1
+    WHERE LENGTH(w1.word) > 1 AND LENGTH(w2.word) > 2
+      AND w1.word NOT IN ('the', 'and', 'for', 'are', 'was', 'has', 'had', 'not',
+                          'that', 'this', 'with', 'from', 'have', 'were', 'been',
+                          'will', 'would', 'could', 'should', 'their', 'there',
+                          'which', 'when', 'where', 'what', 'than', 'then',
+                          'patient', 'patients', 'history', 'report')
+      AND w2.word NOT IN ('the', 'and', 'for', 'are', 'was', 'has', 'had', 'not')
+),
+trigrams AS (
+    SELECT w1.word || ' ' || w2.word || ' ' || w3.word AS phrase
+    FROM words w1
+    JOIN words w2 ON w2.pos = w1.pos + 1
+    JOIN words w3 ON w3.pos = w2.pos + 1
+    WHERE LENGTH(w1.word) > 1 AND LENGTH(w3.word) > 2
+      AND w1.word NOT IN ('the', 'and', 'for', 'are', 'was', 'has', 'had', 'not',
+                          'that', 'this', 'with', 'from', 'have', 'were', 'been',
+                          'will', 'would', 'could', 'should', 'their', 'there',
+                          'patient', 'patients', 'history', 'report')
+      AND w3.word NOT IN ('the', 'and', 'for', 'are', 'was', 'has', 'had', 'not')
+),
+all_phrases AS (
+    SELECT phrase FROM bigrams
+    UNION
+    SELECT phrase FROM trigrams
 ),
 filtered AS (
-    SELECT DISTINCT term,
-           LENGTH(term) AS len,
-           CASE WHEN term LIKE $2 || '%' THEN 0 ELSE 1 END AS priority
-    FROM terms
-    WHERE LENGTH(term) > 3
-      AND ($2::text IS NULL OR term LIKE $2 || '%' OR term LIKE '%' || $2 || '%')
-      AND term NOT IN ('that', 'this', 'with', 'from', 'have', 'were', 'been',
-                       'will', 'would', 'could', 'should', 'their', 'there',
-                       'which', 'when', 'where', 'what', 'than', 'then')
+    SELECT phrase, LENGTH(phrase) AS len
+    FROM all_phrases
+    WHERE LENGTH(phrase) BETWEEN 8 AND 50
+      AND ($2::text IS NULL OR phrase LIKE $2 || '%')
 )
-SELECT term FROM filtered
-WHERE len <= 30
-ORDER BY priority, term
-LIMIT 50
+SELECT phrase FROM filtered
+ORDER BY len, phrase
+LIMIT 30
 """
 
 
@@ -148,21 +218,68 @@ async def search_suggestions(
     context: CurrentContext,
     q: str = "",
 ) -> SearchSuggestionsResponse:
-    """Return search suggestions based on document content.
-
-    Extracts common terms from documents that match the query prefix.
-    Helps users discover relevant medical terminology.
+    """Return search suggestions based on synonyms and common medical terms.
+    
+    Uses synonym mapping to suggest related medical terminology.
+    For example, input 'head' will suggest 'headache', 'migraine', 'tension headache'.
     """
     query = q.strip().lower()[:50]  # Limit query length
-
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(SUGGESTIONS_SQL, context.practice_id, query if query else None)
-
-    suggestions = [row["term"] for row in rows]
-
-    # If we have a query, prioritize terms that start with the query
-    if query:
-        suggestions.sort(key=lambda s: (not s.startswith(query), s))
+    
+    # Synonym mapping for common clinical terms
+    # Keys are root words/phrases, values are lists of related terms
+    SYNONYM_MAP: dict[str, list[str]] = {
+        'head': ['headache', 'migraine', 'tension headache', 'dizziness', 'vertigo'],
+        'chest': ['chest pain', 'angina', 'tightness', 'pressure', 'palpitations'],
+        'pain': ['aching', 'soreness', 'discomfort', 'sharp pain', 'dull ache'],
+        'fever': ['febrile', 'high temperature', 'pyrexia', 'chills', 'hyperthermia'],
+        'blood': ['blood pressure', 'hypertension', 'bleeding', 'hemorrhage', 'anemia'],
+        'breath': ['shortness of breath', 'dyspnea', 'wheezing', 'difficulty breathing'],
+        'nausea': ['vomiting', 'stomach upset', 'gastrointestinal', 'queasy'],
+        'fatigue': ['tiredness', 'exhaustion', 'weakness', 'malaise', 'lethargy'],
+        'swelling': ['edema', 'inflammation', 'swollen', 'effusion', 'distension'],
+        'cough': ['persistent cough', 'dry cough', 'productive cough', 'chronic cough'],
+    }
+    
+    if not query:
+        # Return top-level categories as default suggestions
+        suggestions = [
+            "headache", "migraine", "chest pain", "fever", "fatigue",
+            "shortness of breath", "blood pressure", "nausea", "swelling", "cough"
+        ]
+    else:
+        # Find matching synonym group (exact prefix match first)
+        suggestions = []
+        matched_key = None
+        
+        for key, synonyms in SYNONYM_MAP.items():
+            # Check if query is a prefix of the key
+            if key.startswith(query):
+                matched_key = key
+                suggestions.extend(synonyms)
+                break
+        
+        # If no key match, check if query matches any synonym
+        if not suggestions:
+            for key, synonyms in SYNONYM_MAP.items():
+                for term in synonyms:
+                    if term.startswith(query):
+                        # Found a matching synonym - add its entire synonym group
+                        suggestions.extend(SYNONYM_MAP[key])
+                        # Also add the matching term itself if not already included
+                        if term not in suggestions:
+                            suggestions.append(term)
+                        break
+                if suggestions:
+                    break
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_suggestions = []
+        for s in suggestions:
+            if s.lower() not in seen:
+                seen.add(s.lower())
+                unique_suggestions.append(s)
+        suggestions = unique_suggestions
 
     return SearchSuggestionsResponse(
         query=query,

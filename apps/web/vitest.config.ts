@@ -6,7 +6,10 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   plugins: [react()],
   resolve: {
-    alias: { "@": path.resolve(__dirname) },
+    alias: {
+      "@": path.resolve(__dirname),
+      "server-only": path.resolve(__dirname, "test/stubs/server-only.ts"),
+    },
   },
   test: {
     environment: "jsdom",

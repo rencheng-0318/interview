@@ -1,7 +1,6 @@
 """Core semantic search logic shared by the search API and evaluation.
 
-Primary strategy: hybrid search combining vector similarity + BM25 via
-Reciprocal Rank Fusion (RRF).
+Primary strategy: vector similarity search via pgvector.
 Degradation: falls back to BM25-only when embedding service is unavailable.
 """
 
@@ -16,10 +15,6 @@ from app.clients.embedding_cache import EmbeddingCache
 from app.errors import EmbeddingServiceError
 
 logger = logging.getLogger("api.search.service")
-
-# RRF constant: controls how much weight is given to lower-ranked results.
-# k=60 is the standard value used in information retrieval literature.
-RRF_K = 60
 
 # Vector similarity search using HNSW index
 VECTOR_SEARCH_SQL = """
@@ -63,171 +58,152 @@ ORDER BY relevance_score DESC
 LIMIT $4
 """
 
+# --- Constants ---
+# Candidate retrieval multiplier (based on dataset statistics)
+# Average 3.36 docs per patient, P95=6, max=6
+# Multiplier of 3 provides adequate coverage for limit=10 (30 candidates → ~9 patients)
+# Capped at 100 to reduce database query load
+DEFAULT_CANDIDATE_MULTIPLIER = 3
+MAX_CANDIDATE_LIMIT = 100
 
-def _rrf_fuse(
-    vector_rows: list[dict] | None,
-    bm25_rows: list[dict] | None,
-) -> list[dict]:
-    """Fuse two ranked result lists using Reciprocal Rank Fusion.
 
-    Each chunk-level result gets an RRF score:
-        RRF_score(chunk) = sum(1 / (k + rank)) across strategies
+def make_snippet(content: str, max_length: int = 300) -> str:
+    """Truncate content to max_length at word boundary with ellipsis."""
+    if len(content) <= max_length:
+        return content
+    truncated = content[:max_length].rsplit(" ", 1)[0]
+    return truncated + " ..."
 
-    Results are then aggregated to patient level by summing RRF scores
-    across all chunks belonging to the same patient.
 
-    Returns a list of patient dicts sorted by fused RRF score desc.
+def _aggregate_patients(rows: list[dict]) -> list[dict]:
+    """Aggregate chunk-level results to patient level (one row per patient).
+
+    Groups chunks by patient_id, keeps the highest raw score as the best match,
+    counts additional matching documents, and sorts by relevance score descending.
+    Optimized for performance with minimal dictionary operations.
     """
-    # Map: chunk_key -> {patient_id, rrf_score, best_row}
-    chunk_rrf: dict[str, dict] = {}
-
-    for rank, row in enumerate((vector_rows or []), start=1):
-        key = row["document_id"]
-        if key not in chunk_rrf:
-            chunk_rrf[key] = {
-                "patient_id": row["patient_id"],
-                "rrf_score": 0.0,
-                "best": row,
-            }
-        chunk_rrf[key]["rrf_score"] += 1.0 / (RRF_K + rank)
-        # Keep the row with the higher original relevance for snippet
-        if row["relevance_score"] > chunk_rrf[key]["best"]["relevance_score"]:
-            chunk_rrf[key]["best"] = row
-
-    for rank, row in enumerate((bm25_rows or []), start=1):
-        key = row["document_id"]
-        if key not in chunk_rrf:
-            chunk_rrf[key] = {
-                "patient_id": row["patient_id"],
-                "rrf_score": 0.0,
-                "best": row,
-            }
-        chunk_rrf[key]["rrf_score"] += 1.0 / (RRF_K + rank)
-        if row["relevance_score"] > chunk_rrf[key]["best"]["relevance_score"]:
-            chunk_rrf[key]["best"] = row
-
-    if not chunk_rrf:
-        return []
-
-    # Aggregate to patient level: sum RRF scores, keep best chunk
     patient_map: dict[str, dict] = {}
-    for entry in chunk_rrf.values():
-        pid = entry["patient_id"]
-        if pid not in patient_map:
-            patient_map[pid] = {
-                "display_name": entry["best"]["display_name"],
-                "rrf_score": entry["rrf_score"],
-                "best": entry["best"],
-                "doc_ids": {entry["best"]["document_id"]},
-            }
-        else:
-            patient_map[pid]["rrf_score"] += entry["rrf_score"]
-            patient_map[pid]["doc_ids"].add(entry["best"]["document_id"])
-            if entry["rrf_score"] > patient_map[pid]["rrf_score"]:
-                patient_map[pid]["best"] = entry["best"]
+    
+    for row in rows:
+        pid = row["patient_id"]
+        # Extract once to avoid repeated dict lookups
+        score = float(row["relevance_score"])
+        if score > patient_map.get(pid, {}).get("relevance_score", -1.0):
+            # Only update when we find a higher score
+            if pid not in patient_map:
+                # First time seeing this patient - create full dict
+                patient_map[pid] = {
+                    "patient_id": pid,
+                    "display_name": row["display_name"],
+                    "document_id": row["document_id"],
+                    "document_type": row["document_type"],
+                    "document_title": row["document_title"],
+                    "document_date": row["document_date"],
+                    "snippet": make_snippet(row["content"]),
+                    "relevance_score": score,
+                    "_doc_ids": {row["document_id"]},
+                }
+            else:
+                # Update best match and track document
+                pm = patient_map[pid]
+                pm["_doc_ids"].add(row["document_id"])
+                pm["relevance_score"] = score
+                pm["document_id"] = row["document_id"]
+                pm["document_type"] = row["document_type"]
+                pm["document_title"] = row["document_title"]
+                pm["document_date"] = row["document_date"]
+                pm["snippet"] = make_snippet(row["content"])
 
-    sorted_patients = sorted(
-        patient_map.items(),
-        key=lambda item: item[1]["rrf_score"],
-        reverse=True,
-    )
-
+    # Build final results without additional sorting overhead
     results = []
-    for patient_id, data in sorted_patients:
-        best = data["best"]
-        results.append(
-            {
-                "patient_id": patient_id,
-                "display_name": data["display_name"],
-                "document_id": best["document_id"],
-                "document_type": best["document_type"],
-                "document_title": best["document_title"],
-                "document_date": best["document_date"],
-                "snippet": best["content"][:300],
-                "relevance_score": round(float(data["rrf_score"]), 6),
-                "additional_matching_documents": max(0, len(data["doc_ids"]) - 1),
-            }
-        )
+    for data in patient_map.values():
+        doc_count = len(data.pop("_doc_ids"))
+        results.append({
+            "patient_id": data["patient_id"],
+            "display_name": data["display_name"],
+            "document_id": data["document_id"],
+            "document_type": data["document_type"],
+            "document_title": data["document_title"],
+            "document_date": data["document_date"],
+            "snippet": data["snippet"],
+            "relevance_score": round(data["relevance_score"], 6),
+            "additional_matching_documents": max(0, doc_count - 1),
+        })
+
+    results.sort(key=lambda r: r["relevance_score"], reverse=True)
     return results
 
 
 async def search_patients(
     conn: asyncpg.Connection,
-    embedding_client: SupportsEmbedding,
+    embedding_client: SupportsEmbedding | None,
     query: str,
     practice_id: str,
     doc_types: list[str] | None,
     limit: int,
-    embedding_cache: EmbeddingCache | None = None,
+    query_vector: list[float] | None = None,
 ) -> tuple[list[dict], bool]:
-    """Run hybrid search (vector + BM25) with RRF fusion.
+    """Run vector-first search with BM25 degradation fallback.
 
-    Primary strategy: run vector similarity and BM25 in parallel, then fuse
-    results using Reciprocal Rank Fusion for robust ranking.
+    Primary strategy: vector similarity search via pgvector HNSW index.
     If the embedding service is unavailable, falls back to BM25-only.
 
+    Args:
+        conn: Database connection
+        embedding_client: Embedding client (only used if query_vector is None)
+        query: Search query text
+        practice_id: Practice ID for isolation
+        doc_types: Optional document type filter
+        limit: Target result limit
+        query_vector: Pre-computed query embedding (if None, uses embedding_client)
+
     Returns (results, degraded) where results is a list of patient dicts
-    sorted by fused relevance score desc.
+    sorted by relevance score desc.
     """
     degraded = False
-    candidate_limit = limit * 5
+    # Dynamic candidate limit based on dataset statistics (avg 3.36 docs/patient)
+    candidate_limit = min(limit * DEFAULT_CANDIDATE_MULTIPLIER, MAX_CANDIDATE_LIMIT)
 
-    # --- Prepare query vector (if possible) ---
-    query_vector = None
-    try:
-        cached_vector = None
-        if embedding_cache is not None:
-            cached_vector = embedding_cache.get(query)
-
-        if cached_vector is not None:
-            query_vector = np.array(cached_vector, dtype=np.float32)
-        else:
-            batch = await embedding_client.embed([query])
-            query_vector = np.array(batch.vectors[0], dtype=np.float32)
-            if embedding_cache is not None:
-                embedding_cache.put(query, batch.vectors[0])
-    except (CircuitOpenError, EmbeddingServiceError) as exc:
-        logger.warning(
-            "embedding unavailable, BM25-only: %s",
-            type(exc).__name__,
-        )
-        degraded = True
-
-    # --- Run searches ---
+    # --- Run search ---
     if query_vector is not None:
-        # Run vector and BM25 sequentially (single connection cannot do concurrent queries)
-        vector_rows_raw = await conn.fetch(
+        rows_raw = await conn.fetch(
             VECTOR_SEARCH_SQL,
             query_vector,
             practice_id,
             doc_types,
             candidate_limit,
         )
-        bm25_rows_raw = await conn.fetch(
-            BM25_SEARCH_SQL,
-            query,
-            practice_id,
-            doc_types,
-            candidate_limit,
-        )
-        vector_rows = [dict(r) for r in vector_rows_raw]
-        bm25_rows = [dict(r) for r in bm25_rows_raw]
     else:
-        # BM25-only fallback
-        vector_rows = None
-        bm25_rows_raw = await conn.fetch(
-            BM25_SEARCH_SQL,
-            query,
-            practice_id,
-            doc_types,
-            candidate_limit,
-        )
-        bm25_rows = [dict(r) for r in bm25_rows_raw]
+        # Try to get embedding
+        try:
+            batch = await embedding_client.embed([query])
+            query_vector = batch.vectors[0]
+            rows_raw = await conn.fetch(
+                VECTOR_SEARCH_SQL,
+                query_vector,
+                practice_id,
+                doc_types,
+                candidate_limit,
+            )
+        except (CircuitOpenError, EmbeddingServiceError) as exc:
+            logger.warning(
+                "embedding unavailable, BM25-only fallback: %s",
+                type(exc).__name__,
+            )
+            degraded = True
+            rows_raw = await conn.fetch(
+                BM25_SEARCH_SQL,
+                query,
+                practice_id,
+                doc_types,
+                candidate_limit,
+            )
 
-    if not vector_rows and not bm25_rows:
+    rows = [dict(r) for r in rows_raw]
+    if not rows:
         return [], degraded
 
-    # --- RRF fusion ---
-    fused = _rrf_fuse(vector_rows, bm25_rows)
+    # --- Patient-level aggregation ---
+    aggregated = _aggregate_patients(rows)
 
-    return fused[:limit], degraded
+    return aggregated[:limit], degraded

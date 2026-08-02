@@ -6,7 +6,6 @@ from app.features.indexing import run_indexing
 from tests.conftest import SingleConnectionPool, practice_token
 from tests.stubs import StubEmbeddingClient, UnavailableEmbeddingClient
 
-
 # ---------------------------------------------------------------------------
 # Indexing safety
 # ---------------------------------------------------------------------------
@@ -51,7 +50,8 @@ async def test_changed_document_is_reindexed(
 
     # Modify the document body (triggers source_updated_at update via trigger)
     await connection.execute(
-        "UPDATE clinical_documents SET body = body || ' Updated content for reindex test.' WHERE id = $1",
+        "UPDATE clinical_documents SET body = body || ' Updated content for "
+        "reindex test.' WHERE id = $1",
         doc_id,
     )
 
@@ -157,7 +157,7 @@ async def test_search_performs_exactly_one_embedding_call(
 ) -> None:
     embedding_client.calls.clear()
 
-    response = await api.post(
+    await api.post(
         "/api/clinical-search",
         json={"query": "chest pain"},
         headers={"Authorization": "Bearer demo_user-northside-01"},
