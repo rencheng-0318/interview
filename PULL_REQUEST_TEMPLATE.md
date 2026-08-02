@@ -88,6 +88,57 @@
 
 **结论**：对于当前场景，Recursive Character Splitting 因为保持较好的语义完整性且投入产出比最优，被选为分块策略。
 
+### 索引构建并发策略（分批并行）
+
+**问题背景**：初始索引实现采用串行处理方式，逐个文档进行 embedding 和持久化。对于 2400 个文档、约 4700 个 chunks 的数据量，处理时间较长且资源利用率低。
+
+**方案对比：**
+
+| 方案 | 优势 | 劣势 | 适用场景 |
+|------|------|------|---------||
+| 完全串行 | 简单可靠；调试容易；资源消耗最低 | 慢；CPU 利用率低（~10%）；网络 I/O 等待时间长 | 小数据量（<100 文档）；开发初期 |
+| **分批并行 (选择)** | 速度提升明显（~10x）；可控资源；易于监控进度 | 代码复杂度增加；需调试并发问题 | **中等规模（~5000 chunks）** |
+| 完全并行（全并发） | 理论最快 | OOM 风险；可能压垮 embedding 服务；调试困难；故障隔离差 | 大规模但基础设施完善 |
+
+**关键决策：批量大小（BATCH_SIZE）的权衡**
+
+```python
+BATCH_SIZE = 10  # 每批并行处理的文档数
+```
+
+| 批量大小 | 优势 | 劣势 | 副作用 |
+|---------|------|------|--------|
+| **过小（1-5）** | 资源占用低；故障影响范围小 | 加速效果有限；并发 overhead 占比高 | 不如完全串行优化 |
+| **适中（10-20，选择）** | 速度与稳定性平衡；可预测的资源消耗 | 需要调优找到最佳值 | 对 embedding 服务和 DB 造成适度压力 |
+| **过大（50+）** | 最大并行度；理论最快 | 内存峰值高；可能触发 embedding 服务限流；DB 连接池耗尽；OOM 风险 | 反而因争抢资源导致性能下降 |
+
+**技术实现要点：**
+
+```python
+# Semaphore 控制并发数
+semaphore = asyncio.Semaphore(BATCH_SIZE)
+
+async def embed_document(doc_idx: int):
+    async with semaphore:
+        # 单个文档的 embedding（文档内 chunks 批量发送）
+        batch_result = await embedding_client.embed(doc_chunks_text)
+
+# 批次间顺序执行，避免一次性压垮下游
+for batch_idx in range(0, len(doc_chunks_list), BATCH_SIZE):
+    tasks = [embed_document(i) for i in range(batch_idx, min(batch_idx + BATCH_SIZE, total))]
+    await asyncio.gather(*tasks)
+```
+
+**维护性考量：**
+- DB 写入使用更高的并发度（`Semaphore(BATCH_SIZE * 2)`），因为写入操作快且安全
+- 每个文档保持独立事务，失败不影响其他文档（故障隔离）
+- 日志输出批次进度（`embedding batch 1/200 (10 documents)`），便于监控
+
+**未来扩展路径：**
+- 若扩展到 10k+ 文档：改为流式处理，减少内存峰值
+- 可引入自适应 batching：根据 embedding 服务响应时间动态调整 `BATCH_SIZE`
+- 高并发时可能需要增大 `asyncpg.Pool` 的 max_size
+
 ### 2. 候选检索倍数（真实决策）
 
 先检索多少个 chunk，再聚合后再截断到目标数量？
@@ -206,7 +257,7 @@ results.sort(key=lambda r: r['relevance_score'], reverse=True)
 
 **结论**：分层测试覆盖单元到集成，确定性 stub 保证可重复性，curated case 保障搜索质量。
 
-### 9. 搜索建议实现策略
+### 11. 搜索建议实现策略
 
 搜索建议组件提供用户输入时的自动补全功能，提升查询输入体验。
 
@@ -242,7 +293,7 @@ BM25 降级用于提高语义搜索失败时的召回率，不用于提供搜索
 这不是“缺陷”或“技术债”，而是基于证据的工程决策：在未验证搜索建议的使用频率和查询模式前，不过度优化。
 后续若用户量增长或数据量扩大，有明确的升级路径（pg_trgm → Elasticsearch）。
 
-## 复现步骤
+### 12. 复现步骤
 
 ```bash
 cp .env.example .env

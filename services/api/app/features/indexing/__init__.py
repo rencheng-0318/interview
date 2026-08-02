@@ -1,5 +1,6 @@
 """Indexing workflow: chunk clinical documents and store embeddings."""
 
+import asyncio
 import contextlib
 import logging
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ logger = logging.getLogger("api.indexing")
 MAX_CHUNK_CHARS = 800
 OVERLAP_CHARS = 50
 MAX_TEXT_CHARS = 8_000
+BATCH_SIZE = 10  # Number of documents to process in parallel per batch
 
 
 @dataclass
@@ -121,6 +123,7 @@ WHERE NOT EXISTS (
       AND dc.source_updated_at = cd.source_updated_at
 )
 ORDER BY cd.id
+LIMIT $1
 """
 
 DELETE_CHUNKS_SQL = "DELETE FROM document_chunks WHERE document_id = $1"
@@ -154,13 +157,26 @@ class _DocChunks:
     chunks: list[str]
 
 
-async def run_indexing(pool: asyncpg.Pool, embedding_client: SupportsEmbedding) -> IndexSummary:
-    """Index all new/changed clinical documents."""
+async def run_indexing(
+    pool: asyncpg.Pool, 
+    embedding_client: SupportsEmbedding,
+    max_documents: int | None = None
+) -> IndexSummary:
+    """Index all new/changed clinical documents.
+    
+    Args:
+        pool: Database connection pool
+        embedding_client: Embedding service client
+        max_documents: If set, only index up to this many pending documents (for testing)
+    """
     summary = IndexSummary()
 
     async with pool.acquire() as conn:
         total_in_db = await conn.fetchval(TOTAL_COUNT_SQL)
-        rows = await conn.fetch(PENDING_DOCUMENTS_SQL)
+        if max_documents is not None:
+            rows = await conn.fetch(PENDING_DOCUMENTS_SQL, max_documents)
+        else:
+            rows = await conn.fetch(PENDING_DOCUMENTS_SQL)
 
     summary.total_documents = total_in_db
     summary.already_indexed = total_in_db - len(rows)
@@ -214,7 +230,7 @@ async def run_indexing(pool: asyncpg.Pool, embedding_client: SupportsEmbedding) 
         logger.info("no embeddable content found")
         return summary
 
-    # Phase 2: embed per-document (failure isolation: one doc failure doesn't block others)
+    # Phase 2: embed per document with batching (failure isolation: one doc failure doesn't block others)
     logger.info("embedding chunks=%d documents=%d", len(all_texts), len(doc_chunks_list))
 
     # Build text slices per document
@@ -222,22 +238,44 @@ async def run_indexing(pool: asyncpg.Pool, embedding_client: SupportsEmbedding) 
     for text_idx, doc_idx in enumerate(text_to_doc):
         doc_text_ranges.setdefault(doc_idx, []).append(text_idx)
 
-    # Embed each document's chunks independently
+    # Embed documents in parallel batches for better throughput
     doc_vectors: dict[int, list[list[float]]] = {}
-    for doc_idx, dc in enumerate(doc_chunks_list):
-        text_indices = doc_text_ranges[doc_idx]
-        doc_chunks_text = [all_texts[i] for i in text_indices]
-        try:
-            batch_result = await embedding_client.embed(doc_chunks_text)
-            doc_vectors[doc_idx] = batch_result.vectors
-        except Exception as exc:
-            summary.failed += 1
-            summary.errors.append(f"{dc.doc_id}: embed {type(exc).__name__}")
-            logger.warning("embedding failed document_id=%s error=%s", dc.doc_id, exc)
+    semaphore = asyncio.Semaphore(BATCH_SIZE)
+    
+    async def embed_document(doc_idx: int) -> None:
+        """Embed a single document's chunks."""
+        async with semaphore:
+            dc = doc_chunks_list[doc_idx]
+            text_indices = doc_text_ranges[doc_idx]
+            doc_chunks_text = [all_texts[i] for i in text_indices]
+            try:
+                batch_result = await embedding_client.embed(doc_chunks_text)
+                doc_vectors[doc_idx] = batch_result.vectors
+            except Exception as exc:
+                summary.failed += 1
+                summary.errors.append(f"{dc.doc_id}: embed {type(exc).__name__}")
+                logger.warning("embedding failed document_id=%s error=%s", dc.doc_id, exc)
+    
+    # Process documents in batches
+    total_batches = (len(doc_chunks_list) + BATCH_SIZE - 1) // BATCH_SIZE
+    for batch_idx in range(0, len(doc_chunks_list), BATCH_SIZE):
+        batch_docs = doc_chunks_list[batch_idx:batch_idx + BATCH_SIZE]
+        batch_num = batch_idx // BATCH_SIZE + 1
+        logger.info(
+            "embedding batch %d/%d (%d documents)",
+            batch_num, total_batches, len(batch_docs)
+        )
+        tasks = [embed_document(i) for i in range(batch_idx, min(batch_idx + BATCH_SIZE, len(doc_chunks_list)))]
+        await asyncio.gather(*tasks)
 
-    # Phase 3: persist per document (transaction per doc for fault isolation)
+    # Phase 3: persist per document with batching (transaction per doc for fault isolation)
+    logger.info("persisting chunks to database...")
     async with pool.acquire() as conn:
-        for doc_idx, dc in enumerate(doc_chunks_list):
+        total_batches = (len(doc_chunks_list) + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        async def persist_document(doc_idx: int) -> None:
+            """Persist a single document's chunks to database."""
+            dc = doc_chunks_list[doc_idx]
             if doc_idx not in doc_vectors:
                 # Embedding failed for this doc; clean up any partial chunks
                 try:
@@ -248,7 +286,7 @@ async def run_indexing(pool: asyncpg.Pool, embedding_client: SupportsEmbedding) 
                         dc.doc_id,
                         cleanup_exc,
                     )
-                continue
+                return
 
             vectors = doc_vectors[doc_idx]
             text_indices = doc_text_ranges[doc_idx]
@@ -276,6 +314,25 @@ async def run_indexing(pool: asyncpg.Pool, embedding_client: SupportsEmbedding) 
                 summary.failed += 1
                 summary.errors.append(f"{dc.doc_id}: write {type(exc).__name__}")
                 logger.warning("write failed document_id=%s error=%s", dc.doc_id, exc)
+        
+        # Process persistence in batches
+        semaphore = asyncio.Semaphore(BATCH_SIZE * 2)  # Higher concurrency for DB writes
+        
+        async def persist_with_semaphore(doc_idx: int) -> None:
+            async with semaphore:
+                await persist_document(doc_idx)
+        
+        for batch_idx in range(0, len(doc_chunks_list), BATCH_SIZE):
+            batch_num = batch_idx // BATCH_SIZE + 1
+            logger.info(
+                "persisting batch %d/%d (%d documents)",
+                batch_num, total_batches, len(doc_chunks_list[batch_idx:batch_idx + BATCH_SIZE])
+            )
+            tasks = [
+                persist_with_semaphore(i)
+                for i in range(batch_idx, min(batch_idx + BATCH_SIZE, len(doc_chunks_list)))
+            ]
+            await asyncio.gather(*tasks)
 
     logger.info(
         "indexing complete total=%d indexed=%d skipped=%d failed=%d chunks=%d",

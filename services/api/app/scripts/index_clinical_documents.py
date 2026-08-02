@@ -12,7 +12,7 @@ from app.observability import configure_logging
 logger = logging.getLogger("api.scripts.index")
 
 
-async def run(database: str) -> int:
+async def run(database: str, max_documents: int | None = None) -> int:
     settings = get_settings()
     dsn = settings.test_database_url if database == "test" else settings.database_url
 
@@ -24,7 +24,7 @@ async def run(database: str) -> int:
 
     try:
         async with open_pool(dsn, min_size=1, max_size=3) as pool:
-            summary = await run_indexing(pool, embedding_client)
+            summary = await run_indexing(pool, embedding_client, max_documents=max_documents)
     finally:
         await embedding_client.aclose()
 
@@ -35,6 +35,8 @@ async def run(database: str) -> int:
     print(f"  skipped:          {summary.skipped}")
     print(f"  failed:           {summary.failed}")
     print(f"  chunks created:   {summary.chunks_created}")
+    if max_documents is not None:
+        print(f"  max limit:        {max_documents}")
     print(f"{'='*40}")
 
     if summary.errors:
@@ -50,11 +52,13 @@ async def run(database: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the semantic search index.")
     parser.add_argument("--database", choices=("app", "test"), default="app")
+    parser.add_argument("--max-documents", type=int, default=None,
+                       help="Only index up to N pending documents (for testing)")
     args = parser.parse_args()
 
     configure_logging(get_settings().api_log_level)
     try:
-        return asyncio.run(run(args.database))
+        return asyncio.run(run(args.database, max_documents=args.max_documents))
     except Exception as exc:
         logger.error("indexing failed: %s", exc)
         return 1
